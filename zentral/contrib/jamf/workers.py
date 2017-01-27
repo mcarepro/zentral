@@ -1,17 +1,21 @@
+import json
 import logging
-from .api_client import APIClient, APIClientError
+import re
+from dateutil import parser
 from zentral.contrib.inventory.models import MachineGroup, MachineSnapshot, MachineSnapshotCommit
 from zentral.contrib.inventory.utils import inventory_events_from_machine_snapshot_commit
 from zentral.core.events import event_cls_from_type
 from zentral.core.events.base import EventMetadata
 from zentral.core.queues import queues
+from zentral.contrib.jamf.events import JAMFChangeManagementEvent, JAMFSoftwareServerEvent
+from .api_client import APIClient, APIClientError
 
 
 logger = logging.getLogger("zentral.contrib.jamf.preprocessor")
 
 
-class Preprocessor(object):
-    name = "jamf events preprocessor"
+class WebhookEventPreprocessor(object):
+    name = "jamf webhook events preprocessor"
     input_queue_name = "jamf_events"
 
     def __init__(self):
@@ -125,5 +129,106 @@ class Preprocessor(object):
         )
 
 
+class BeatPreprocessor(object):
+    name = "jamf beats preprocessor"
+    input_queue_name = "jamf_beats"
+    USER_RE = re.compile(r'^(?P<name>.*) \(ID: (?P<id>\d+)\)$')
+    OBJECT_INFO_SEP_RE = re.compile("[ \.]{2,}")
+
+    def add_payload_jamf_instance(self, payload, raw_event_d):
+        jamf_instance = raw_event_d["fields"]["jamf_instance"]
+        jamf_instance.setdefault("path", "/JSSResource")
+        jamf_instance.setdefault("port", 8443)
+        payload["jamf_instance"] = jamf_instance
+
+    def get_created_at(self, raw_event_d):
+        return parser.parse(raw_event_d["@timestamp"])
+
+    def build_change_management_event(self, raw_event_d):
+        object_type = raw_event_d["object"]
+        payload = {"action": raw_event_d["action"],
+                   "object": {"type": object_type}}
+        # object
+        object_id = None
+        for object_info_line in raw_event_d.get("object_info", "").splitlines():
+            object_info_line = object_info_line.strip()
+            if not object_info_line or object_info_line.startswith("-"):
+                # empty line or line separator
+                continue
+            try:
+                k, v = self.OBJECT_INFO_SEP_RE.split(object_info_line, 1)
+            except ValueError:
+                logger.warning("Unable to parse object info line '%s'", object_info_line)
+            else:
+                if not v:
+                    continue
+                k = k.lower().replace(" ", "_")
+                if k == "id":
+                    v = object_id = int(v)
+                elif k == "type":
+                    logger.warning("Object info type key conflict")
+                    continue
+                elif v == "false":
+                    v = False
+                elif v == "true":
+                    v = True
+                payload["object"][k] = v
+        # jamf instance
+        self.add_payload_jamf_instance(payload, raw_event_d)
+        # user
+        user_m = self.USER_RE.match(raw_event_d["user"])
+        if user_m:
+            payload["user"] = {"id": int(user_m.group("id")),
+                               "name": user_m.group("name")}
+        # machine serial number
+        machine_serial_number = None
+        device_type = None
+        if object_type == "Mobile Device":
+            device_type = "mobile_device"
+        elif object_type == "Computer":
+            device_type = "computer"
+        if device_type and object_id:
+            kwargs = {"reference": "{},{}".format(device_type, object_id),
+                      "source__module": "zentral.contrib.jamf",
+                      "source__name": "jamf",
+                      "source__config": payload["jamf_instance"]}
+            try:
+                ms = MachineSnapshot.objects.filter(**kwargs).order_by('-id')[0]
+            except IndexError:
+                pass
+            else:
+                machine_serial_number = ms.serial_number
+        # event
+        metadata = EventMetadata(JAMFChangeManagementEvent.event_type,
+                                 machine_serial_number=machine_serial_number,
+                                 created_at=self.get_created_at(raw_event_d),
+                                 tags=JAMFChangeManagementEvent.tags)
+        return JAMFChangeManagementEvent(metadata, payload)
+
+    def build_software_server_event(self, raw_event_d):
+        payload = {"log_level": raw_event_d["log_level"],
+                   "info_1": raw_event_d["info_1"],
+                   "component": raw_event_d["component"],
+                   "message": raw_event_d["cleaned_message"]}
+        # jamf instance
+        self.add_payload_jamf_instance(payload, raw_event_d)
+        # event
+        metadata = EventMetadata(JAMFSoftwareServerEvent.event_type,
+                                 created_at=self.get_created_at(raw_event_d),
+                                 tags=JAMFSoftwareServerEvent.tags)
+        return JAMFSoftwareServerEvent(metadata, payload)
+
+    def process_raw_event(self, raw_event):
+        raw_event_d = json.loads(raw_event)
+        raw_event_type = raw_event_d["type"]
+        if raw_event_type == "jamf_change_management":
+            yield self.build_change_management_event(raw_event_d)
+        elif raw_event_type == "jamf_software_server":
+            yield self.build_software_server_event(raw_event_d)
+        else:
+            logger.warning("Unknown event type %s", raw_event_type)
+
+
 def get_workers():
-    yield queues.get_preprocessor_worker(Preprocessor())
+    yield queues.get_preprocessor_worker(WebhookEventPreprocessor())
+    yield queues.get_preprocessor_worker(BeatPreprocessor())
